@@ -32,6 +32,10 @@ class ReActAgent(BaseAgent, ABC):
 
     async def step(self) -> str:
         """Execute a single step: think and act."""
+        # Limpar status das ferramentas executadas no passo anterior
+        if hasattr(self, 'step_tools_status'):  # Verificar se o atributo existe
+            self.step_tools_status = []
+            
         should_act = await self.think()
         if not should_act:
             return "Thinking complete - no action needed"

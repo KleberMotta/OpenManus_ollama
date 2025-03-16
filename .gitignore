@@ -178,3 +178,5 @@ data/
 
 # Workspace
 workspace/
+hypothesis/
+execution_data/

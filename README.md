@@ -45,6 +45,15 @@ cd OpenManus
 
 ```bash
 pip install -r requirements.txt
+
+# IMPORTANTE: Instalar os navegadores do Playwright
+python -m playwright install
+```
+
+Alternativamente, no Windows, você pode usar o script de setup:
+
+```bash
+setup.bat
 ```
 
 ### Method 2: Using uv (Recommended)
@@ -75,6 +84,9 @@ source .venv/bin/activate  # On Unix/macOS
 
 ```bash
 uv pip install -r requirements.txt
+
+# IMPORTANTE: Instalar os navegadores do Playwright
+python -m playwright install
 ```
 
 ## Configuration

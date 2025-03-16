@@ -44,6 +44,12 @@ class ToolResult(BaseModel):
 
     def __bool__(self):
         return any(getattr(self, field) for field in self.__fields__)
+        
+    def __len__(self):
+        """Returns the length of the output string, or 0 if output is None."""
+        if self.output is None:
+            return 0
+        return len(str(self.output))
 
     def __add__(self, other: "ToolResult"):
         def combine_fields(

@@ -11,6 +11,7 @@ from pydantic_core.core_schema import ValidationInfo
 
 from app.config import config
 from app.tool.base import BaseTool, ToolResult
+from app.logger import logger
 
 
 MAX_LENGTH = 2000
@@ -134,7 +135,18 @@ class BrowserUseTool(BaseTool):
                         if not isinstance(value, list) or value:
                             browser_config_kwargs[attr] = value
 
-            self.browser = BrowserUseBrowser(BrowserConfig(**browser_config_kwargs))
+            try:
+                self.browser = BrowserUseBrowser(BrowserConfig(**browser_config_kwargs))
+            except Exception as e:
+                logger.error(f"Erro ao inicializar o navegador: {str(e)}")
+                # Tente com argumento de segurança desativado
+                if "disable_security" not in browser_config_kwargs:
+                    browser_config_kwargs["disable_security"] = True
+                    try:
+                        self.browser = BrowserUseBrowser(BrowserConfig(**browser_config_kwargs))
+                        logger.info("Navegador inicializado com segurança desativada")
+                    except Exception as inner_e:
+                        raise RuntimeError(f"Não foi possível inicializar o navegador: {str(inner_e)}")
 
         if self.context is None:
             context_config = BrowserContextConfig()
@@ -182,12 +194,55 @@ class BrowserUseTool(BaseTool):
         async with self.lock:
             try:
                 context = await self._ensure_browser_initialized()
+                
+                # Detectar padrao incorreto comum (url em get_html)
+                if action == "get_html" and url:
+                    # Uso incorreto detectado, fazer navegação primeiro
+                    logger.warning(f"Detected incorrect usage pattern! Automatically navigating to {url} before get_html")
+                    await context.navigate_to(url)
+                    await asyncio.sleep(2)  # Dar tempo para carregar
 
                 if action == "navigate":
                     if not url:
                         return ToolResult(error="URL is required for 'navigate' action")
-                    await context.navigate_to(url)
-                    return ToolResult(output=f"Navigated to {url}")
+                    try:
+                        await context.navigate_to(url)
+                        # Verificar se a navegação retornou 404 ou erro de conexão
+                        status_code = await context.execute_javascript(
+                            """(function() {
+                                // Verificar se existe propriedade performanceEntries
+                                if (window.performance && window.performance.getEntries) {
+                                    const entries = window.performance.getEntries();
+                                    for (const entry of entries) {
+                                        if (entry.name === window.location.href) {
+                                            return entry.responseStatus || 200;
+                                        }
+                                    }
+                                }
+                                // Verificar status com base no conteúdo da página
+                                if (document.title.includes('404') || 
+                                    document.body.textContent.includes('not found') ||
+                                    document.body.textContent.includes('404') ||
+                                    document.body.textContent.includes('não encontrada')) {
+                                    return 404;
+                                }
+                                return 200;
+                            })();"""
+                        )
+                        
+                        if status_code == 404:
+                            error_msg = f"❌ URL INVÁLIDA: {url} retornou erro 404 (página não encontrada). Por favor revise os resultados da busca e escolha outra URL válida."
+                            logger.warning(error_msg)
+                            return ToolResult(error=error_msg)
+                            
+                        return ToolResult(output=f"Navigated to {url}")
+                    except Exception as e:
+                        error_msg = f"Error navigating to {url}: {str(e)}"
+                        # Erro específico para URLs inválidas
+                        if "404" in str(e) or "ERR_NAME_NOT_RESOLVED" in str(e) or "net::ERR" in str(e):
+                            error_msg = f"❌ URL INVÁLIDA: {url} não existe ou está inacessível. Por favor revise os resultados da busca e escolha outra URL válida."
+                        logger.warning(error_msg)
+                        return ToolResult(error=error_msg)
 
                 elif action == "click":
                     if index is None:
@@ -222,15 +277,264 @@ class BrowserUseTool(BaseTool):
                     )
 
                 elif action == "get_html":
-                    html = await context.get_page_html()
-                    truncated = (
-                        html[:MAX_LENGTH] + "..." if len(html) > MAX_LENGTH else html
-                    )
-                    return ToolResult(output=truncated)
+                    try:
+                        # Proteger com timeout para evitar bloqueio indefinido
+                        async def get_html_with_timeout(self, timeout=30):
+                            # Dar tempo para a página carregar completamente
+                            await asyncio.sleep(5)
+                            
+                            # Lista para armazenar resultados de diferentes métodos
+                            html_results = []
+                            error_messages = []
+                            
+                            # Aumentado o limite máximo de caracteres para evitar truncamento
+                            MAX_LENGTH = 250000
+                            
+                            # Tentativa 1: Método padrão via browser_use
+                            try:
+                                html = await context.get_page_html()
+                                if html and len(html) > 100 and "<body></body>" not in html:
+                                    html_results.append(("standard", html))
+                            except Exception as e:
+                                error_messages.append(f"Standard method failed: {str(e)}")
+                            
+                            # Tentativa 2: Via JavaScript document.documentElement.outerHTML
+                            try:
+                                js_html = await context.execute_javascript("document.documentElement.outerHTML")
+                                if js_html and len(js_html) > 100:
+                                    html_results.append(("javascript_outerhtml", js_html))
+                            except Exception as e:
+                                error_messages.append(f"JavaScript outerHTML method failed: {str(e)}")
+                            
+                            # Tentativa 3: Via JavaScript innerHTML
+                            try:
+                                js_inner_html = await context.execute_javascript("document.body.innerHTML")
+                                if js_inner_html and len(js_inner_html) > 100:
+                                    wrapped_html = f"<html><body>{js_inner_html}</body></html>"
+                                    html_results.append(("javascript_innerhtml", wrapped_html))
+                            except Exception as e:
+                                error_messages.append(f"JavaScript innerHTML method failed: {str(e)}")
+                            
+                            # Nova tentativa: Obter HTML serializado via API do Chrome
+                            try:
+                                serialized_html = await context.execute_javascript("""
+                                    (function() {
+                                        try {
+                                            let parser = new DOMParser();
+                                            let serializer = new XMLSerializer();
+                                            let doc = parser.parseFromString(document.documentElement.outerHTML, "text/html");
+                                            return serializer.serializeToString(doc);
+                                        } catch(e) {
+                                            return "Error: " + e.message;
+                                        }
+                                    })()
+                                """)
+                                
+                                if serialized_html and len(serialized_html) > 100 and not serialized_html.startswith("Error:"):
+                                    html_results.append(("serialized", serialized_html))
+                            except Exception as e:
+                                error_messages.append(f"Serialization method failed: {str(e)}")
+                            
+                            # Tentativa 4: Extrair apenas o texto se outros métodos falharem
+                            try:
+                                text_content = await context.execute_javascript("""
+                                    (function() {
+                                        const textNodes = [];
+                                        const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                                        let node;
+                                        while(node = walk.nextNode()) {
+                                            if (node.textContent.trim().length > 0) {
+                                                textNodes.push(node.textContent.trim());
+                                            }
+                                        }
+                                        return textNodes.join('\n');
+                                    })()
+                                """)
+                                
+                                if text_content and len(text_content) > 50:
+                                    formatted_text = f"<html><body><pre>{text_content}</pre></body></html>"
+                                    html_results.append(("text_content", formatted_text))
+                            except Exception as e:
+                                error_messages.append(f"Text extraction method failed: {str(e)}")
+                            
+                            # Selecionar o melhor resultado baseado no tamanho e qualidade
+                            if html_results:
+                                # Verificar se algum resultado contém as tags html e body
+                                complete_results = [r for r in html_results if r[1] and "<html" in r[1].lower() and "<body" in r[1].lower()]
+                                
+                                # Priorizar resultados completos, ou usar todos se não houver completos
+                                results_to_use = complete_results if complete_results else html_results
+                                
+                                # Ordenar por tamanho (do maior para o menor)
+                                results_to_use.sort(key=lambda x: len(x[1]), reverse=True)
+                                method, html = results_to_use[0]
+                                
+                                # Registrar sucesso e detalhes para diagnóstico
+                                logger.info(f"HTML extraction successful using '{method}' method ({len(html)} characters)")
+                                logger.info(f"HTML inicia com: {html[:100].replace('\n', ' ')}...")
+                                
+                                # Verificar a qualidade do HTML
+                                has_html_tag = "<html" in html.lower()
+                                has_body_tag = "<body" in html.lower()
+                                has_content = len(html) > 1000
+                                
+                                logger.info(f"Qualidade do HTML - Tags HTML: {has_html_tag}, Tags Body: {has_body_tag}, Tamanho adequado: {has_content}")
+                                
+                                # Truncar se necessário, mas preservar um tamanho muito maior
+                                if len(html) > MAX_LENGTH:
+                                    truncated = html[:MAX_LENGTH] + f"\n... (content truncated, total: {len(html)} characters)"
+                                else:
+                                    truncated = html
+                                    
+                                return ToolResult(output=truncated)
+                            else:
+                                # Fallback: registrar o erro e recomendar tentar outra URL
+                                error_summary = "\n".join(error_messages)
+                                logger.warning(f"All HTML extraction attempts failed: {error_summary}")
+                                
+                                # Criar um HTML informativo em vez de retornar apenas um erro
+                                fallback_html = f"""
+                                <html>
+                                <body>
+                                <h1>⚠️ Erro na extração do conteúdo</h1>
+                                <p>Não foi possível obter o conteúdo HTML desta página. Isso pode ocorrer por vários motivos:</p>
+                                <ul>
+                                    <li>O site usa técnicas anti-scraping</li>
+                                    <li>O site requer interação do usuário (login ou CAPTCHA)</li>
+                                    <li>Problemas de conexão ou timeout</li>
+                                    <li>Conteúdo dinâmico que requer JavaScript</li>
+                                </ul>
+                                <p><strong>Recomendação:</strong> Tente acessar outra URL dos resultados da busca.</p>
+                                <p><strong>IMPORTANTE:</strong> Você deve tentar com uma das outras URLs retornadas pelo comando web_search. Use o comando browser_use com action=navigate para acessar outra URL da lista.</p>
+                                </body>
+                                </html>
+                                """
+                                
+                                # Retornar o HTML de fallback com um código de erro especial para sinalizar ao agente
+                                logger.error("HTML_EXTRACTION_ERROR: Tentando próxima URL dos resultados da busca...")
+                                return ToolResult(output=fallback_html, error="HTML_EXTRACTION_ERROR: Tente outra URL dos resultados")
+                                
+                        # Executar a função de extração de HTML com timeout
+                        html_task = asyncio.create_task(get_html_with_timeout(self))
+                        return await asyncio.wait_for(html_task, timeout=30)  # 30 segundos máximo
+                        
+                    except asyncio.TimeoutError:
+                        # Timeout atingido, retornar mensagem informativa
+                        logger.error("TIMEOUT: A extração de HTML excedeu o limite de tempo (30s)")
+                        fallback_html = f"""
+                        <html>
+                        <body>
+                        <h1>⚠️ Erro: Timeout na extração</h1>
+                        <p>Não foi possível extrair o HTML desta página dentro do tempo limite (30 segundos).</p>
+                        <p>Isso geralmente ocorre em páginas muito complexas ou com problemas de carregamento.</p>
+                        <p><strong>Solução recomendada:</strong> Tente uma das seguintes opções:</p>
+                        <ol>
+                            <li>Use o comando browser_use com action=get_text para extrair apenas o texto da página atual</li>
+                            <li>Tente acessar outra URL dos resultados da pesquisa</li>
+                        </ol>
+                        </body>
+                        </html>
+                        """
+                        return ToolResult(output=fallback_html, error="Timeout na extração de HTML após 30 segundos")
+                    except Exception as e:
+                        # Erro geral, informar o usuário
+                        logger.error(f"Erro na extração de HTML: {str(e)}")
+                        error_html = f"""
+                        <html>
+                        <body>
+                        <h1>❌ Erro na extração de HTML</h1>
+                        <p>Ocorreu um erro ao tentar extrair o HTML desta página:</p>
+                        <pre>{str(e)}</pre>
+                        <p>Tente usar action=get_text como alternativa, ou acesse outra URL dos resultados.</p>
+                        </body>
+                        </html>
+                        """
+                        return ToolResult(output=error_html, error=f"Erro na extração de HTML: {str(e)}")
 
                 elif action == "get_text":
-                    text = await context.execute_javascript("document.body.innerText")
-                    return ToolResult(output=text)
+                    await asyncio.sleep(2)  # Dar tempo para carregar
+                    try:
+                        # Versão corrigida do JavaScript para extrair texto de forma mais robusta
+                        fixed_js = """
+                        (function() {
+                            try {
+                                // Função para obter texto visível de forma mais robusta
+                                function extractVisibleText() {
+                                    const textParts = [];
+                                    
+                                    // Selecionar elementos comuns de texto
+                                    const selectors = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'th', 'div:not(:has(*))', 'span:not(:has(*))'];
+                                    
+                                    for (let i = 0; i < selectors.length; i++) {
+                                        try {
+                                            const elements = document.querySelectorAll(selectors[i]);
+                                            for (let j = 0; j < elements.length; j++) {
+                                                try {
+                                                    const el = elements[j];
+                                                    // Verificar se o elemento é visível
+                                                    const style = window.getComputedStyle(el);
+                                                    if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                                        const text = el.innerText || el.textContent;
+                                                        if (text && text.trim().length > 0) {
+                                                            textParts.push(text.trim());
+                                                        }
+                                                    }
+                                                } catch (elementError) {
+                                                    // Ignorar erros em elementos específicos
+                                                }
+                                            }
+                                        } catch (selectorError) {
+                                            // Ignorar erros em seletores específicos
+                                        }
+                                    }
+                                    
+                                    return textParts.join('\n');
+                                }
+                                
+                                // Tentar extrair texto com método mais seguro
+                                const extractedText = extractVisibleText();
+                                if (extractedText && extractedText.length > 0) {
+                                    return extractedText;
+                                }
+                                
+                                // Fallbacks sequenciais
+                                if (document.body.innerText && document.body.innerText.length > 0) {
+                                    return document.body.innerText;
+                                }
+                                
+                                if (document.body.textContent && document.body.textContent.length > 0) {
+                                    return document.body.textContent;
+                                }
+                                
+                                return 'Nenhum texto extraído';
+                            } catch (e) {
+                                return 'Erro na extração de texto: ' + e.message;
+                            }
+                        })();
+                        """
+                        
+                        # Executar o JavaScript corrigido
+                        text = await context.execute_javascript(fixed_js)
+                        
+                        # Verificar se foi obtido um resultado válido
+                        if not text or text.startswith('Erro na extração'):
+                            logger.warning(f"Problema na extração de texto: {text}")
+                            # Tentar método alternativo como fallback
+                            try:
+                                simple_js = "document.body.textContent.replace(/\\s+/g, ' ').trim()"
+                                text = await context.execute_javascript(simple_js)
+                            except Exception as inner_e:
+                                logger.warning(f"Fallback também falhou: {str(inner_e)}")
+                                return ToolResult(error=f"Falha na extração de texto: {text}")
+                            
+                        # Limpar e formatar o texto
+                        cleaned_text = text.replace('\t', ' ').replace('\r', '').replace('\n\n\n', '\n\n')
+                        
+                        return ToolResult(output=cleaned_text[:MAX_LENGTH] if len(cleaned_text) > MAX_LENGTH else cleaned_text)
+                    except Exception as e:
+                        error_msg = f"Falha ao extrair texto: {str(e)}"
+                        logger.error(error_msg)
+                        return ToolResult(error=error_msg)
 
                 elif action == "read_links":
                     links = await context.execute_javascript(
@@ -305,21 +609,63 @@ class BrowserUseTool(BaseTool):
 
     async def cleanup(self):
         """Clean up browser resources."""
-        async with self.lock:
-            if self.context is not None:
-                await self.context.close()
-                self.context = None
-                self.dom_service = None
-            if self.browser is not None:
-                await self.browser.close()
-                self.browser = None
+        import sys
+        from app.logger import logger
+        
+        logger.info("Iniciando cleanup do browser...")
+        try:
+            async with self.lock:
+                # Fechar o contexto primeiro
+                if self.context is not None:
+                    try:
+                        logger.info("Fechando contexto do browser...")
+                        await self.context.close()
+                        self.context = None
+                        self.dom_service = None
+                        logger.info("Contexto do browser fechado com sucesso.")
+                    except Exception as e:
+                        logger.error(f"Erro ao fechar o contexto do browser: {e}")
+                
+                # Depois fechar o browser
+                if self.browser is not None:
+                    try:
+                        logger.info("Fechando instância do browser...")
+                        await self.browser.close()
+                        self.browser = None
+                        logger.info("Instância do browser fechada com sucesso.")
+                    except Exception as e:
+                        logger.error(f"Erro ao fechar o browser: {e}")
+                        
+                # Forçar a limpeza de referências
+                import gc
+                gc.collect()
+                
+                logger.info("Cleanup do browser concluído com sucesso.")
+        except Exception as e:
+            logger.error(f"Erro geral durante o cleanup do browser: {e}")
 
     def __del__(self):
         """Ensure cleanup when object is destroyed."""
         if self.browser is not None or self.context is not None:
             try:
-                asyncio.run(self.cleanup())
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.cleanup())
-                loop.close()
+                # Tentar obter o loop existente
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # Se o loop estiver em execução, agendar o cleanup
+                        loop.create_task(self.cleanup())
+                    else:
+                        # Se não estiver em execução, rodar diretamente
+                        loop.run_until_complete(self.cleanup())
+                except RuntimeError:
+                    # Se não houver um loop em execução, criar um novo
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.cleanup())
+                    loop.close()
+            except Exception as e:
+                # Em caso de erro, pelo menos limpar as referências
+                print(f"Error during browser cleanup: {e}")
+                self.browser = None
+                self.context = None
+                self.dom_service = None

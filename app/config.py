@@ -18,11 +18,16 @@ WORKSPACE_ROOT = PROJECT_ROOT / "workspace"
 class LLMSettings(BaseModel):
     model: str = Field(..., description="Model name")
     base_url: str = Field(..., description="API base URL")
-    api_key: str = Field(..., description="API key")
+    api_key: Optional[str] = Field(default=None, description="API key (opcional para Ollama)")
     max_tokens: int = Field(4096, description="Maximum number of tokens per request")
     temperature: float = Field(1.0, description="Sampling temperature")
-    api_type: str = Field(..., description="AzureOpenai or Openai")
-    api_version: str = Field(..., description="Azure Openai version if AzureOpenai")
+    api_type: str = Field(..., description="AzureOpenai or Openai or local")
+    api_version: str = Field(..., description="API version if needed")
+    
+    def model_post_init(self, __context):
+        # Se api_type for local (Ollama) e api_key for None, definir um valor padrão
+        if self.api_type == "local" and self.api_key is None:
+            self.api_key = "not-needed-for-local"
 
 
 class ProxySettings(BaseModel):
@@ -114,7 +119,7 @@ class Config:
         default_settings = {
             "model": base_llm.get("model"),
             "base_url": base_llm.get("base_url"),
-            "api_key": base_llm.get("api_key"),
+            "api_key": base_llm.get("api_key", "not-needed-for-local" if base_llm.get("api_type") == "local" else None),
             "max_tokens": base_llm.get("max_tokens", 4096),
             "temperature": base_llm.get("temperature", 1.0),
             "api_type": base_llm.get("api_type", ""),

@@ -130,9 +130,17 @@ class PlanningFlow(BaseFlow):
         # Process tool calls if present
         if response.tool_calls:
             for tool_call in response.tool_calls:
-                if tool_call.function.name == "planning":
+                # Se tool_call é um dicionário (caso do Ollama)
+                if isinstance(tool_call, dict) and 'function' in tool_call:
+                    function = tool_call['function']
+                    name = function.get('name')
+                else:  # Se for um objeto com atributos (caso da OpenAI)
+                    function = tool_call.function
+                    name = function.name if hasattr(function, 'name') else None
+                    
+                if name == "planning":
                     # Parse the arguments
-                    args = tool_call.function.arguments
+                    args = function.get('arguments') if isinstance(function, dict) else function.arguments
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
@@ -140,9 +148,34 @@ class PlanningFlow(BaseFlow):
                             logger.error(f"Failed to parse tool arguments: {args}")
                             continue
 
-                    # Ensure plan_id is set correctly and execute the tool
+                    # Ensure plan_id and command are set correctly
                     args["plan_id"] = self.active_plan_id
-
+                    
+                    # Se o comando não estiver presente nos argumentos, adicione "create" como padrão
+                    if "command" not in args:
+                        # Analisar argumentos para determinar o comando apropriado
+                        if "plan_steps" in args or "steps" in args:
+                            args["command"] = "create"
+                            
+                            # Converter plan_steps para steps, se necessário
+                            if "plan_steps" in args and "steps" not in args:
+                                args["steps"] = args.pop("plan_steps")
+                                
+                    # Garantir que command existe nos argumentos
+                    if "command" not in args:
+                        args["command"] = "create"
+                        
+                    # Se for comando 'create', garantir que title existe
+                    if args.get("command") == "create":
+                        if "title" not in args:
+                            # Tentar usar plan_name como título, se disponível
+                            if "plan_name" in args:
+                                args["title"] = args.pop("plan_name")
+                            else:
+                                # Usar título padrão baseado no request
+                                request_preview = request[:30] + '...' if len(request) > 30 else request
+                                args["title"] = f"Plan for: {request_preview}"
+                    
                     # Execute the tool via ToolCollection instead of directly
                     result = await self.planning_tool.execute(**args)
 

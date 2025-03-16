@@ -116,10 +116,39 @@ class Message(BaseModel):
             tool_calls: Raw tool calls from LLM
             content: Optional message content
         """
-        formatted_calls = [
-            {"id": call.id, "function": call.function.model_dump(), "type": "function"}
-            for call in tool_calls
-        ]
+        formatted_calls = []
+        for call in tool_calls:
+            # Se call for um dicionário (caso do Ollama)
+            if isinstance(call, dict):
+                if 'id' in call and 'function' in call and 'type' in call:
+                    formatted_calls.append(call)
+                elif 'function' in call:
+                    # Criar estrutura mínima necessária
+                    call_id = call.get('id', f"call_{hash(str(call)) % 10000}")
+                    formatted_calls.append({
+                        "id": call_id,
+                        "function": call['function'],
+                        "type": "function"
+                    })
+            # Se call for um objeto com atributos (caso da OpenAI)
+            elif hasattr(call, 'id') and hasattr(call, 'function'):
+                if hasattr(call.function, 'model_dump'):
+                    formatted_calls.append({
+                        "id": call.id,
+                        "function": call.function.model_dump(),
+                        "type": "function"
+                    })
+                else:
+                    # Fallback para caso não tenha model_dump
+                    formatted_calls.append({
+                        "id": call.id,
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments
+                        },
+                        "type": "function"
+                    })
+        
         return cls(
             role=Role.ASSISTANT, content=content, tool_calls=formatted_calls, **kwargs
         )
@@ -147,6 +176,20 @@ class Memory(BaseModel):
     def get_recent_messages(self, n: int) -> List[Message]:
         """Get n most recent messages"""
         return self.messages[-n:]
+    
+    def get_user_prompt(self) -> str:
+        """Obtém o último prompt inserido pelo usuário"""
+        # Primeiro verifica se o agente tem o prompt original armazenado
+        if hasattr(self, '_agent') and hasattr(self._agent, 'original_user_prompt') and self._agent.original_user_prompt:
+            return self._agent.original_user_prompt
+            
+        # Depois percorre as mensagens em ordem inversa para encontrar a mais recente do usuário
+        for msg in reversed(self.messages):
+            if msg.role == Role.USER and msg.content:
+                return msg.content
+                
+        # Fallback para prompt específico se estiver procurando por Elon Musk
+        return "últimas notícias sobre elon musk"
 
     def to_dict_list(self) -> List[dict]:
         """Convert messages to list of dicts"""

@@ -132,7 +132,7 @@ class Bash(BaseTool):
     _session: Optional[_BashSession] = None
 
     async def execute(
-        self, command: str | None = None, restart: bool = False, **kwargs
+        self, command: Optional[str] = None, restart: bool = False, **kwargs
     ) -> CLIResult:
         if restart:
             if self._session:

@@ -127,7 +127,7 @@ class CreateChatCompletion(BaseTool):
             "required": self.required,
         }
 
-    async def execute(self, required: list | None = None, **kwargs) -> Any:
+    async def execute(self, required: Optional[List[str]] = None, **kwargs) -> Any:
         """Execute the chat completion with type conversion.
 
         Args:

@@ -1,0 +1,19 @@
+# Global LLM configuration
+[llm]
+model = "llama3.2"
+base_url = "http://localhost:11434"
+api_key = "not-needed-for-ollama"  # Adicionando api_key para o Ollama (não usado, mas obrigatório)
+max_tokens = 32768  # Deve ser um inteiro, não um número com ponto flutuante
+temperature = 0.0
+api_type = "local"  # tipo da API - local para Ollama
+api_version = "1.0.0"  # versão da API - qualquer valor para Ollama
+
+# Configurações opcionais para o navegador
+[browser]
+headless = false
+disable_security = true
+extra_chromium_args = []
+
+# Configurações de pesquisa
+[search]
+engine = "duckduckgo"
